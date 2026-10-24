@@ -11,25 +11,17 @@ import {
   Maximize2,
   Tv,
   Layers,
-  AlertTriangle,
-  RefreshCw,
-  HardDrive,
-  Film,
   Zap,
-  MonitorPlay,
-  Check,
+  Info,
 } from 'lucide-react';
 import { apiService } from '@/services/api';
 import { EpisodeDetail, StreamServer, DownloadFormat } from '@/types/anime';
 import { ErrorState } from '@/components/ErrorState';
 import { useWatchHistory } from '@/hooks/useStorage';
 
-interface PlayableStream {
-  format: string;
+interface Mp4Stream {
   resolution: string;
-  server: string;
   streamUrl: string;
-  type: 'video' | 'iframe';
 }
 
 export const WatchPage: React.FC = () => {
@@ -37,96 +29,74 @@ export const WatchPage: React.FC = () => {
   const navigate = useNavigate();
 
   const [episode, setEpisode] = useState<EpisodeDetail | null>(null);
-  const [playableStreams, setPlayableStreams] = useState<PlayableStream[]>([]);
-  const [selectedStream, setSelectedStream] = useState<PlayableStream | null>(null);
-
-  // Player mode: 'direct' (HTML5 video), 'acefile' (Iframe player), 'server' (Samehadaku API)
-  const [playerMode, setPlayerMode] = useState<'direct' | 'acefile' | 'server'>('direct');
-
-  // Samehadaku API server state
   const [activeServer, setActiveServer] = useState<StreamServer | null>(null);
+  const [isDirectMode, setIsDirectMode] = useState<boolean>(false);
+
+  // Direct MP4 streams extracted from episode downloads
+  const [mp4Streams, setMp4Streams] = useState<Mp4Stream[]>([]);
+  const [selectedQuality, setSelectedQuality] = useState<Mp4Stream | null>(null);
+
+  // Server iframe response from /api/server/:post/:nume
   const [embedSrc, setEmbedSrc] = useState<string | null>(null);
   const [embedHtml, setEmbedHtml] = useState<string | null>(null);
-  const [serverStatus, setServerStatus] = useState<'loading' | 'ready' | 'unavailable'>('loading');
+  const [isLoadingServer, setIsLoadingServer] = useState<boolean>(false);
+  const [usedDirectFallback, setUsedDirectFallback] = useState<boolean>(false);
 
-  const [isLoadingEp, setIsLoadingEp] = useState(true);
+  const [isLoadingEp, setIsLoadingEp] = useState<boolean>(true);
   const [activeFormatTab, setActiveFormatTab] = useState<string>('MKV');
   const [theaterMode, setTheaterMode] = useState<boolean>(false);
-  const [videoError, setVideoError] = useState<boolean>(false);
 
   const { saveProgress } = useWatchHistory();
   const videoRef = useRef<HTMLVideoElement>(null);
   const playerContainerRef = useRef<HTMLDivElement>(null);
 
-  // 1. Fetch episode data & extract direct playable streams
+  // 1. Fetch episode data
   useEffect(() => {
     if (!slug) return;
     setIsLoadingEp(true);
     setEmbedSrc(null);
     setEmbedHtml(null);
-    setVideoError(false);
+    setUsedDirectFallback(false);
 
     apiService
       .getEpisodeDetail(slug)
       .then((data) => {
         setEpisode(data);
 
-        // Extract direct playable streams from downloads
-        const extracted: PlayableStream[] = [];
-        const downloads = data.downloads || [];
-
-        // Preferred formats order: MP4 first (broadest browser support), then x265, then MKV
-        const sortedDownloads = [...downloads].sort((a, b) => {
-          if (a.format.includes('MP4')) return -1;
-          if (b.format.includes('MP4')) return 1;
-          return 0;
-        });
-
-        for (const fmt of sortedDownloads) {
-          for (const res of fmt.resolutions || []) {
-            for (const link of res.links || []) {
-              // 1. Pixeldrain Direct (Direct MP4/MKV video stream)
-              const pixelMatch = link.url.match(/pixeldrain\.com\/u\/([a-zA-Z0-9_-]+)/);
-              if (pixelMatch && pixelMatch[1]) {
-                extracted.push({
-                  format: fmt.format,
-                  resolution: res.resolution,
-                  server: 'Pixeldrain Direct',
-                  streamUrl: `https://pixeldrain.com/api/file/${pixelMatch[1]}`,
-                  type: 'video',
-                });
-              }
-
-              // 2. Acefile Player (Direct iframe player embed)
-              const aceMatch = link.url.match(/acefile\.co\/f\/(\d+)/);
-              if (aceMatch && aceMatch[1]) {
-                extracted.push({
-                  format: fmt.format,
-                  resolution: res.resolution,
-                  server: 'Acefile Player',
-                  streamUrl: `https://acefile.co/player/${aceMatch[1]}`,
-                  type: 'iframe',
-                });
+        // Extract pure MP4 direct video streams (zero login, zero ads)
+        const extracted: Mp4Stream[] = [];
+        for (const fmt of data.downloads || []) {
+          if (fmt.format.toUpperCase().includes('MP4')) {
+            for (const res of fmt.resolutions || []) {
+              for (const link of res.links || []) {
+                const pixelMatch = link.url.match(/pixeldrain\.com\/u\/([a-zA-Z0-9_-]+)/);
+                if (pixelMatch && pixelMatch[1]) {
+                  extracted.push({
+                    resolution: res.resolution,
+                    streamUrl: `https://pixeldrain.com/api/file/${pixelMatch[1]}`,
+                  });
+                }
               }
             }
           }
         }
 
-        setPlayableStreams(extracted);
+        setMp4Streams(extracted);
 
-        // Auto select best stream (preferred 720p or 480p or first available)
-        if (extracted.length > 0) {
-          const preferred =
-            extracted.find((s) => s.resolution === '720p' && s.type === 'video') ||
-            extracted.find((s) => s.resolution === '480p' && s.type === 'video') ||
-            extracted.find((s) => s.type === 'video') ||
-            extracted[0];
+        // Best quality default (MP4HD/720p or FULLHD or first)
+        const preferred =
+          extracted.find((s) => s.resolution === 'MP4HD' || s.resolution === '720p') ||
+          extracted.find((s) => s.resolution === 'FULLHD' || s.resolution === '1080p') ||
+          extracted[0] ||
+          null;
+        setSelectedQuality(preferred);
 
-          setSelectedStream(preferred);
-          setPlayerMode(preferred.type === 'video' ? 'direct' : 'acefile');
-        } else if (data.streamServers && data.streamServers.length > 0) {
+        // Set default server from API streamServers
+        if (data.streamServers && data.streamServers.length > 0) {
           setActiveServer(data.streamServers[0]);
-          setPlayerMode('server');
+          setIsDirectMode(false);
+        } else if (preferred) {
+          setIsDirectMode(true);
         }
 
         if (data.downloads && data.downloads.length > 0) {
@@ -154,20 +124,20 @@ export const WatchPage: React.FC = () => {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }, [slug]);
 
-  // 2. Handle Samehadaku server API selection
+  // 2. Fetch server embed from /api/server/:post/:nume
   useEffect(() => {
-    if (playerMode !== 'server' || !activeServer) return;
+    if (!activeServer || isDirectMode) return;
 
-    setServerStatus('loading');
+    setIsLoadingServer(true);
     setEmbedSrc(null);
     setEmbedHtml(null);
+    setUsedDirectFallback(false);
 
     apiService
       .getServerEmbed(activeServer.dataPost, activeServer.dataNume, activeServer.dataType || 'schtml')
       .then((res) => {
         if (res.embedUrl) {
           setEmbedSrc(res.embedUrl);
-          setServerStatus('ready');
         } else if (res.html && res.html !== '-1') {
           const matchSrc = res.html.match(/src=["'](.*?)["']/i);
           if (matchSrc && matchSrc[1]) {
@@ -175,16 +145,19 @@ export const WatchPage: React.FC = () => {
           } else {
             setEmbedHtml(res.html);
           }
-          setServerStatus('ready');
         } else {
-          // Upstream Samehadaku returned -1 or empty
-          setServerStatus('unavailable');
+          // Upstream Samehadaku API returned html: "-1" because of Cloudflare bot protection on admin-ajax.php
+          // Instead of showing a broken screen, seamlessly fallback to the Direct MP4 stream!
+          setUsedDirectFallback(true);
         }
       })
       .catch(() => {
-        setServerStatus('unavailable');
+        setUsedDirectFallback(true);
+      })
+      .finally(() => {
+        setIsLoadingServer(false);
       });
-  }, [playerMode, activeServer]);
+  }, [activeServer, isDirectMode]);
 
   // Keyboard navigation for Prev/Next & Theater
   useEffect(() => {
@@ -228,23 +201,6 @@ export const WatchPage: React.FC = () => {
 
   const parentSlug = episode.parentAnime?.slug || slug?.replace(/-episode-\d+.*$/, '') || '';
 
-  // Get distinct resolutions for the direct video player
-  const directVideoQualities = Array.from(
-    new Map(
-      playableStreams
-        .filter((s) => s.type === 'video')
-        .map((s) => [s.resolution, s])
-    ).values()
-  );
-
-  const acefileQualities = Array.from(
-    new Map(
-      playableStreams
-        .filter((s) => s.type === 'iframe')
-        .map((s) => [s.resolution, s])
-    ).values()
-  );
-
   return (
     <div className="pb-16 space-y-8">
       {/* Top Breadcrumb Bar */}
@@ -276,112 +232,83 @@ export const WatchPage: React.FC = () => {
         <div ref={playerContainerRef} className="space-y-3">
           <div className="relative aspect-video w-full rounded bg-black border border-border overflow-hidden shadow-elevated">
             
-            {/* Player View: Direct HTML5 Video */}
-            {playerMode === 'direct' && selectedStream && !videoError ? (
-              <video
-                ref={videoRef}
-                key={selectedStream.streamUrl}
-                src={selectedStream.streamUrl}
-                controls
-                autoPlay
-                playsInline
-                className="w-full h-full object-contain bg-black"
-                onError={() => {
-                  console.warn('Video error on stream, falling back to iframe');
-                  setVideoError(true);
-                  if (acefileQualities.length > 0) {
-                    setPlayerMode('acefile');
-                    setSelectedStream(acefileQualities[0]);
-                  }
-                }}
-              >
-                Browser Anda tidak mendukung pemutar video HTML5.
-              </video>
-            ) : playerMode === 'acefile' && selectedStream ? (
-              /* Player View: Acefile Embed Iframe */
+            {/* Loading Indicator for API Server */}
+            {isLoadingServer && (
+              <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/85 backdrop-blur-xs">
+                <div className="w-10 h-10 border-3 border-primary border-t-transparent rounded-full animate-spin mb-3" />
+                <p className="text-xs font-semibold text-neutral-300">
+                  Memuat dari server {activeServer?.serverName || 'Samehadaku'}...
+                </p>
+              </div>
+            )}
+
+            {/* Notification Badge if auto-switched to direct stream */}
+            {usedDirectFallback && !isDirectMode && (
+              <div className="absolute top-3 left-3 right-3 z-20 bg-background-elevated/90 backdrop-blur-sm border border-border-subtle p-2.5 rounded text-xs text-neutral-300 flex items-center justify-between gap-3 shadow-md">
+                <div className="flex items-center gap-2">
+                  <Info className="w-4 h-4 text-accent-amber flex-shrink-0" />
+                  <span>
+                    Server <strong>{activeServer?.serverName}</strong> membatasi iframe langsung. Memutar via <strong>Direct Stream MP4</strong>.
+                  </span>
+                </div>
+                <button
+                  onClick={() => setUsedDirectFallback(false)}
+                  className="text-[11px] text-neutral-400 hover:text-white"
+                >
+                  Tutup
+                </button>
+              </div>
+            )}
+
+            {/* Video Player Render */}
+            {isDirectMode || (usedDirectFallback && selectedQuality) ? (
+              /* Native HTML5 Video Stream */
+              selectedQuality ? (
+                <video
+                  ref={videoRef}
+                  key={selectedQuality.streamUrl}
+                  src={selectedQuality.streamUrl}
+                  controls
+                  autoPlay
+                  playsInline
+                  className="w-full h-full object-contain bg-black"
+                >
+                  Browser Anda tidak mendukung pemutar video HTML5.
+                </video>
+              ) : null
+            ) : embedSrc ? (
+              /* Server Iframe Embed from /api/server/:post/:nume */
               <iframe
-                src={selectedStream.streamUrl}
+                src={embedSrc}
                 title={episode.title}
                 className="w-full h-full border-0"
                 allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
                 allowFullScreen
               />
-            ) : playerMode === 'server' ? (
-              /* Player View: Samehadaku API Server */
-              serverStatus === 'loading' ? (
-                <div className="w-full h-full flex flex-col items-center justify-center bg-black/90">
-                  <div className="w-10 h-10 border-3 border-primary border-t-transparent rounded-full animate-spin mb-3" />
-                  <p className="text-xs font-semibold text-neutral-300">
-                    Menghubungkan ke {activeServer?.serverName || 'server'}...
-                  </p>
-                </div>
-              ) : serverStatus === 'ready' && embedSrc ? (
-                <iframe
-                  src={embedSrc}
-                  title={episode.title}
-                  className="w-full h-full border-0"
-                  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-                  allowFullScreen
-                />
-              ) : serverStatus === 'ready' && embedHtml ? (
-                <div
-                  dangerouslySetInnerHTML={{ __html: embedHtml }}
-                  className="w-full h-full flex items-center justify-center [&>iframe]:w-full [&>iframe]:h-full [&>iframe]:border-0"
-                />
-              ) : (
-                /* Auto-switch prompt if server returned -1 */
-                <div className="w-full h-full flex flex-col items-center justify-center p-6 text-center bg-gradient-to-b from-[#111319] to-[#090a0f]">
-                  <div className="w-12 h-12 rounded-full bg-primary/10 border border-primary/20 flex items-center justify-center text-primary mb-3">
-                    <Zap className="w-6 h-6 text-primary" />
-                  </div>
-                  <h3 className="text-base font-bold text-white mb-2">
-                    Server {activeServer?.serverName} Sedang Mengalami Hambatan
-                  </h3>
-                  <p className="text-xs text-neutral-400 max-w-md mb-5 leading-relaxed">
-                    Server Samehadaku ini sedang membatasi pemutaran lintas domain. Klik tombol di bawah untuk langsung menonton menggunakan <strong>iWatch Direct Player HD</strong>.
-                  </p>
-                  <button
-                    onClick={() => {
-                      setPlayerMode('direct');
-                      if (directVideoQualities.length > 0) {
-                        setSelectedStream(directVideoQualities[0]);
-                      }
-                    }}
-                    className="inline-flex items-center gap-2 px-5 py-2.5 rounded bg-primary hover:bg-primary-hover text-white text-xs font-bold transition-colors shadow-card"
-                  >
-                    <Play className="w-4 h-4 fill-white" />
-                    <span>Putar Sekarang (iWatch Direct Player HD)</span>
-                  </button>
-                </div>
-              )
+            ) : embedHtml ? (
+              /* Raw HTML Iframe Embed */
+              <div
+                dangerouslySetInnerHTML={{ __html: embedHtml }}
+                className="w-full h-full flex items-center justify-center [&>iframe]:w-full [&>iframe]:h-full [&>iframe]:border-0"
+              />
             ) : (
-              /* Fallback if everything else is unavailable */
-              <div className="w-full h-full flex flex-col items-center justify-center p-6 text-center bg-gradient-to-b from-[#111319] to-[#090a0f]">
-                <MonitorPlay className="w-10 h-10 text-primary mb-3" />
-                <h3 className="text-base font-bold text-white mb-2">
-                  Pilih Sumber Pemutar Video
-                </h3>
-                <p className="text-xs text-neutral-400 max-w-sm mb-4">
-                  Pilih salah satu server pemutar di bawah untuk mulai memutar video secara instan.
-                </p>
-                {directVideoQualities.length > 0 && (
-                  <button
-                    onClick={() => {
-                      setPlayerMode('direct');
-                      setSelectedStream(directVideoQualities[0]);
-                    }}
-                    className="px-4 py-2 rounded bg-primary text-white text-xs font-bold"
-                  >
-                    Putar via Direct Player
-                  </button>
-                )}
-              </div>
+              /* Fallback direct video player */
+              selectedQuality && (
+                <video
+                  ref={videoRef}
+                  src={selectedQuality.streamUrl}
+                  controls
+                  autoPlay
+                  playsInline
+                  className="w-full h-full object-contain bg-black"
+                />
+              )
             )}
           </div>
 
           {/* Quick Player Bar: Prev / Next / Theater */}
           <div className="flex flex-wrap items-center justify-between gap-3 p-3 rounded bg-background-surface border border-border-subtle text-xs">
-            {/* Prev Episode */}
+            {/* Prev / Next Episode Buttons */}
             <div className="flex items-center gap-2">
               <button
                 onClick={() => episode.navigation?.prevEpisodeSlug && navigate(`/nonton/${episode.navigation.prevEpisodeSlug}`)}
@@ -402,7 +329,33 @@ export const WatchPage: React.FC = () => {
               </button>
             </div>
 
-            {/* Title & Theater Toggle */}
+            {/* Quality Selector (if Direct MP4 Stream is available) */}
+            {mp4Streams.length > 0 && (
+              <div className="flex items-center gap-1 bg-background-elevated p-1 rounded border border-border-subtle">
+                <span className="text-[11px] text-neutral-400 px-2 font-medium">Resolusi:</span>
+                {mp4Streams.map((q) => {
+                  const isSelected = selectedQuality?.resolution === q.resolution;
+                  return (
+                    <button
+                      key={q.resolution}
+                      onClick={() => {
+                        setSelectedQuality(q);
+                        setIsDirectMode(true);
+                      }}
+                      className={`px-2 py-0.5 rounded text-[11px] font-bold transition-all ${
+                        isSelected && (isDirectMode || usedDirectFallback)
+                          ? 'bg-primary text-white shadow-xs'
+                          : 'text-neutral-400 hover:text-white'
+                      }`}
+                    >
+                      {q.resolution}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Theater Mode Toggle */}
             <div className="flex items-center gap-3">
               {parentSlug && (
                 <Link
@@ -410,7 +363,7 @@ export const WatchPage: React.FC = () => {
                   className="flex items-center gap-1 text-neutral-400 hover:text-white transition-colors"
                 >
                   <Layers className="w-3.5 h-3.5" />
-                  <span>Daftar Semua Episode</span>
+                  <span className="hidden sm:inline">Semua Episode</span>
                 </Link>
               )}
 
@@ -430,123 +383,59 @@ export const WatchPage: React.FC = () => {
           </div>
         </div>
 
-        {/* Server & Quality Switcher Console */}
-        <div className="p-4 rounded bg-background-surface border border-border-subtle space-y-4">
-          
-          {/* Main Engine Mode Selection */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-bold text-neutral-300 uppercase tracking-wider flex items-center gap-1.5">
-                <Server className="w-4 h-4 text-primary" />
-                <span>Pilih Mesin Pemutar:</span>
-              </span>
-              <span className="text-[11px] text-neutral-500 hidden sm:inline">
-                Pilih mesin pemutar jika satu server bermasalah
-              </span>
-            </div>
-
-            <div className="flex flex-wrap gap-2">
-              {/* Direct Player (HTML5 Native) */}
-              {directVideoQualities.length > 0 && (
-                <button
-                  onClick={() => {
-                    setPlayerMode('direct');
-                    setVideoError(false);
-                    if (!selectedStream || selectedStream.type !== 'video') {
-                      setSelectedStream(directVideoQualities[0]);
-                    }
-                  }}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-bold border transition-all ${
-                    playerMode === 'direct'
-                      ? 'bg-primary text-white border-primary shadow-xs'
-                      : 'bg-background-subtle border-border-subtle text-neutral-400 hover:text-white'
-                  }`}
-                >
-                  <Zap className="w-3.5 h-3.5 fill-current" />
-                  <span>⚡ iWatch Direct Player HD (Rekomendasi)</span>
-                </button>
-              )}
-
-              {/* Acefile Player */}
-              {acefileQualities.length > 0 && (
-                <button
-                  onClick={() => {
-                    setPlayerMode('acefile');
-                    if (!selectedStream || selectedStream.type !== 'iframe') {
-                      setSelectedStream(acefileQualities[0]);
-                    }
-                  }}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-bold border transition-all ${
-                    playerMode === 'acefile'
-                      ? 'bg-primary text-white border-primary shadow-xs'
-                      : 'bg-background-subtle border-border-subtle text-neutral-400 hover:text-white'
-                  }`}
-                >
-                  <Film className="w-3.5 h-3.5" />
-                  <span>Acefile Embed Player</span>
-                </button>
-              )}
-            </div>
+        {/* Streaming Servers Selector Console (From REST API /api/server/:post/:nume) */}
+        <div className="p-4 rounded bg-background-surface border border-border-subtle space-y-3">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-bold text-neutral-300 uppercase tracking-wider flex items-center gap-1.5">
+              <Server className="w-4 h-4 text-primary" />
+              <span>Pilihan Server Streaming (REST API):</span>
+            </span>
+            <span className="text-[11px] text-neutral-500 hidden sm:inline">
+              Klik server untuk memutar via API iframe
+            </span>
           </div>
 
-          {/* Quality Selector (when Direct Player or Acefile Player is active) */}
-          {playerMode === 'direct' && directVideoQualities.length > 0 && (
-            <div className="pt-2 border-t border-border-subtle/60 flex flex-wrap items-center gap-2">
-              <span className="text-xs font-semibold text-neutral-400 mr-2">
-                Pilih Kualitas Video:
-              </span>
-              {directVideoQualities.map((item) => {
-                const isSelected = selectedStream?.streamUrl === item.streamUrl;
-                return (
-                  <button
-                    key={item.resolution}
-                    onClick={() => {
-                      setSelectedStream(item);
-                      setVideoError(false);
-                    }}
-                    className={`px-3 py-1 rounded text-xs font-bold border transition-all ${
-                      isSelected
-                        ? 'bg-accent-amber/15 text-accent-amber border-accent-amber'
-                        : 'bg-background-elevated border-border-subtle text-neutral-300 hover:text-white'
-                    }`}
-                  >
-                    {item.resolution}
-                  </button>
-                );
-              })}
-            </div>
-          )}
+          <div className="flex flex-wrap gap-2">
+            {/* Direct Player Button */}
+            {mp4Streams.length > 0 && (
+              <button
+                onClick={() => {
+                  setIsDirectMode(true);
+                  setUsedDirectFallback(false);
+                }}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-bold border transition-all ${
+                  isDirectMode
+                    ? 'bg-primary text-white border-primary shadow-xs'
+                    : 'bg-background-subtle border-border-subtle text-neutral-400 hover:text-white'
+                }`}
+              >
+                <Zap className="w-3.5 h-3.5 fill-current" />
+                <span>⚡ Direct Stream MP4</span>
+              </button>
+            )}
 
-          {/* Samehadaku Server Selector (Alternative fallback) */}
-          {episode.streamServers && episode.streamServers.length > 0 && (
-            <div className="pt-2 border-t border-border-subtle/60 space-y-2">
-              <span className="text-xs font-semibold text-neutral-400 block">
-                Server Asli Samehadaku (Jika Ingin Mencoba Server Web Asli):
-              </span>
-              <div className="flex flex-wrap gap-1.5">
-                {episode.streamServers.map((s) => {
-                  const isActive = playerMode === 'server' && activeServer?.id === s.id;
-                  return (
-                    <button
-                      key={s.id}
-                      onClick={() => {
-                        setPlayerMode('server');
-                        setActiveServer(s);
-                      }}
-                      className={`flex items-center gap-1 px-2.5 py-1 rounded text-xs font-medium border transition-all ${
-                        isActive
-                          ? 'bg-primary text-white border-primary shadow-xs'
-                          : 'bg-background-subtle border-border-subtle text-neutral-400 hover:text-white hover:border-neutral-600'
-                      }`}
-                    >
-                      <Play className="w-2.5 h-2.5 fill-current" />
-                      <span>{s.serverName}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          )}
+            {/* Official Stream Servers from /api/episode/:slug */}
+            {episode.streamServers?.map((s) => {
+              const isActive = !isDirectMode && activeServer?.id === s.id;
+              return (
+                <button
+                  key={s.id}
+                  onClick={() => {
+                    setIsDirectMode(false);
+                    setActiveServer(s);
+                  }}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium border transition-all ${
+                    isActive
+                      ? 'bg-primary text-white border-primary shadow-xs font-semibold'
+                      : 'bg-background-subtle border-border-subtle text-neutral-400 hover:text-white hover:border-neutral-600'
+                  }`}
+                >
+                  <Play className="w-2.5 h-2.5 fill-current" />
+                  <span>{s.serverName}</span>
+                </button>
+              );
+            })}
+          </div>
         </div>
 
         {/* Episode Info Heading */}
