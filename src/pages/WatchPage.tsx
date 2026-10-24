@@ -12,12 +12,19 @@ import {
   Tv,
   Layers,
   Zap,
-  Info,
+  Check,
+  Film,
 } from 'lucide-react';
 import { apiService } from '@/services/api';
 import { EpisodeDetail, StreamServer, DownloadFormat } from '@/types/anime';
 import { ErrorState } from '@/components/ErrorState';
 import { useWatchHistory } from '@/hooks/useStorage';
+
+interface FiledonStream {
+  resolution: string;
+  embedUrl: string;
+  format: string;
+}
 
 interface Mp4Stream {
   resolution: string;
@@ -29,18 +36,23 @@ export const WatchPage: React.FC = () => {
   const navigate = useNavigate();
 
   const [episode, setEpisode] = useState<EpisodeDetail | null>(null);
-  const [activeServer, setActiveServer] = useState<StreamServer | null>(null);
-  const [isDirectMode, setIsDirectMode] = useState<boolean>(false);
 
-  // Direct MP4 streams extracted from episode downloads
+  // Active player mode: 'filedon' (Iframe Filedon), 'direct' (HTML5 Video), 'api' (Samehadaku /api/server)
+  const [playerMode, setPlayerMode] = useState<'filedon' | 'direct' | 'api'>('filedon');
+
+  // Filedon stream options (extracted from episode data)
+  const [filedonStreams, setFiledonStreams] = useState<FiledonStream[]>([]);
+  const [selectedFiledon, setSelectedFiledon] = useState<FiledonStream | null>(null);
+
+  // Direct MP4 streams
   const [mp4Streams, setMp4Streams] = useState<Mp4Stream[]>([]);
-  const [selectedQuality, setSelectedQuality] = useState<Mp4Stream | null>(null);
+  const [selectedMp4, setSelectedMp4] = useState<Mp4Stream | null>(null);
 
-  // Server iframe response from /api/server/:post/:nume
-  const [embedSrc, setEmbedSrc] = useState<string | null>(null);
-  const [embedHtml, setEmbedHtml] = useState<string | null>(null);
-  const [isLoadingServer, setIsLoadingServer] = useState<boolean>(false);
-  const [usedDirectFallback, setUsedDirectFallback] = useState<boolean>(false);
+  // Samehadaku API server state
+  const [activeApiServer, setActiveApiServer] = useState<StreamServer | null>(null);
+  const [apiEmbedSrc, setApiEmbedSrc] = useState<string | null>(null);
+  const [apiEmbedHtml, setApiEmbedHtml] = useState<string | null>(null);
+  const [isLoadingApiServer, setIsLoadingApiServer] = useState<boolean>(false);
 
   const [isLoadingEp, setIsLoadingEp] = useState<boolean>(true);
   const [activeFormatTab, setActiveFormatTab] = useState<string>('MKV');
@@ -54,24 +66,38 @@ export const WatchPage: React.FC = () => {
   useEffect(() => {
     if (!slug) return;
     setIsLoadingEp(true);
-    setEmbedSrc(null);
-    setEmbedHtml(null);
-    setUsedDirectFallback(false);
+    setApiEmbedSrc(null);
+    setApiEmbedHtml(null);
 
     apiService
       .getEpisodeDetail(slug)
       .then((data) => {
         setEpisode(data);
 
-        // Extract pure MP4 direct video streams (zero login, zero ads)
-        const extracted: Mp4Stream[] = [];
+        // A. Extract Filedon streams (prefer MP4 format)
+        const filedonList: FiledonStream[] = [];
+        const mp4List: Mp4Stream[] = [];
+
         for (const fmt of data.downloads || []) {
-          if (fmt.format.toUpperCase().includes('MP4')) {
-            for (const res of fmt.resolutions || []) {
-              for (const link of res.links || []) {
+          for (const res of fmt.resolutions || []) {
+            for (const link of res.links || []) {
+              // 1. Check Filedon
+              if (link.server.toLowerCase().includes('filedon')) {
+                const match = link.url.match(/filedon\.co\/(?:view|embed)\/([a-zA-Z0-9_-]+)/);
+                if (match && match[1]) {
+                  filedonList.push({
+                    resolution: res.resolution,
+                    embedUrl: `https://filedon.co/embed/${match[1]}`,
+                    format: fmt.format,
+                  });
+                }
+              }
+
+              // 2. Check Pixeldrain MP4
+              if (fmt.format.toUpperCase().includes('MP4')) {
                 const pixelMatch = link.url.match(/pixeldrain\.com\/u\/([a-zA-Z0-9_-]+)/);
                 if (pixelMatch && pixelMatch[1]) {
-                  extracted.push({
+                  mp4List.push({
                     resolution: res.resolution,
                     streamUrl: `https://pixeldrain.com/api/file/${pixelMatch[1]}`,
                   });
@@ -81,22 +107,33 @@ export const WatchPage: React.FC = () => {
           }
         }
 
-        setMp4Streams(extracted);
+        // Sort Filedon to have MP4 first, and distinct resolutions
+        const distinctFiledon = Array.from(
+          new Map(
+            filedonList
+              .sort((a, b) => (a.format.includes('MP4') ? -1 : 1))
+              .map((item) => [item.resolution, item])
+          ).values()
+        );
 
-        // Best quality default (MP4HD/720p or FULLHD or first)
-        const preferred =
-          extracted.find((s) => s.resolution === 'MP4HD' || s.resolution === '720p') ||
-          extracted.find((s) => s.resolution === 'FULLHD' || s.resolution === '1080p') ||
-          extracted[0] ||
-          null;
-        setSelectedQuality(preferred);
+        setFiledonStreams(distinctFiledon);
+        setMp4Streams(mp4List);
 
-        // Set default server from API streamServers
-        if (data.streamServers && data.streamServers.length > 0) {
-          setActiveServer(data.streamServers[0]);
-          setIsDirectMode(false);
-        } else if (preferred) {
-          setIsDirectMode(true);
+        // Set default stream: prefer 720p/MP4HD on Filedon, or 1080p, or first available
+        if (distinctFiledon.length > 0) {
+          const pref =
+            distinctFiledon.find((f) => f.resolution === 'MP4HD' || f.resolution === '720p') ||
+            distinctFiledon.find((f) => f.resolution === 'FULLHD' || f.resolution === '1080p') ||
+            distinctFiledon[0];
+
+          setSelectedFiledon(pref);
+          setPlayerMode('filedon');
+        } else if (mp4List.length > 0) {
+          setSelectedMp4(mp4List[0]);
+          setPlayerMode('direct');
+        } else if (data.streamServers && data.streamServers.length > 0) {
+          setActiveApiServer(data.streamServers[0]);
+          setPlayerMode('api');
         }
 
         if (data.downloads && data.downloads.length > 0) {
@@ -124,40 +161,42 @@ export const WatchPage: React.FC = () => {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }, [slug]);
 
-  // 2. Fetch server embed from /api/server/:post/:nume
+  // 2. Fetch server embed from Samehadaku API if 'api' mode is chosen
   useEffect(() => {
-    if (!activeServer || isDirectMode) return;
+    if (playerMode !== 'api' || !activeApiServer) return;
 
-    setIsLoadingServer(true);
-    setEmbedSrc(null);
-    setEmbedHtml(null);
-    setUsedDirectFallback(false);
+    setIsLoadingApiServer(true);
+    setApiEmbedSrc(null);
+    setApiEmbedHtml(null);
 
     apiService
-      .getServerEmbed(activeServer.dataPost, activeServer.dataNume, activeServer.dataType || 'schtml')
+      .getServerEmbed(activeApiServer.dataPost, activeApiServer.dataNume, activeApiServer.dataType || 'schtml')
       .then((res) => {
         if (res.embedUrl) {
-          setEmbedSrc(res.embedUrl);
+          setApiEmbedSrc(res.embedUrl);
         } else if (res.html && res.html !== '-1') {
           const matchSrc = res.html.match(/src=["'](.*?)["']/i);
           if (matchSrc && matchSrc[1]) {
-            setEmbedSrc(matchSrc[1]);
+            setApiEmbedSrc(matchSrc[1]);
           } else {
-            setEmbedHtml(res.html);
+            setApiEmbedHtml(res.html);
           }
         } else {
-          // Upstream Samehadaku API returned html: "-1" because of Cloudflare bot protection on admin-ajax.php
-          // Instead of showing a broken screen, seamlessly fallback to the Direct MP4 stream!
-          setUsedDirectFallback(true);
+          // If Samehadaku AJAX returns -1, automatically switch to Filedon
+          if (filedonStreams.length > 0) {
+            setPlayerMode('filedon');
+          }
         }
       })
       .catch(() => {
-        setUsedDirectFallback(true);
+        if (filedonStreams.length > 0) {
+          setPlayerMode('filedon');
+        }
       })
       .finally(() => {
-        setIsLoadingServer(false);
+        setIsLoadingApiServer(false);
       });
-  }, [activeServer, isDirectMode]);
+  }, [playerMode, activeApiServer, filedonStreams]);
 
   // Keyboard navigation for Prev/Next & Theater
   useEffect(() => {
@@ -232,78 +271,63 @@ export const WatchPage: React.FC = () => {
         <div ref={playerContainerRef} className="space-y-3">
           <div className="relative aspect-video w-full rounded bg-black border border-border overflow-hidden shadow-elevated">
             
-            {/* Loading Indicator for API Server */}
-            {isLoadingServer && (
+            {/* Loading Indicator for Samehadaku API Server */}
+            {isLoadingApiServer && (
               <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/85 backdrop-blur-xs">
                 <div className="w-10 h-10 border-3 border-primary border-t-transparent rounded-full animate-spin mb-3" />
                 <p className="text-xs font-semibold text-neutral-300">
-                  Memuat dari server {activeServer?.serverName || 'Samehadaku'}...
+                  Menghubungkan ke server {activeApiServer?.serverName}...
                 </p>
               </div>
             )}
 
-            {/* Notification Badge if auto-switched to direct stream */}
-            {usedDirectFallback && !isDirectMode && (
-              <div className="absolute top-3 left-3 right-3 z-20 bg-background-elevated/90 backdrop-blur-sm border border-border-subtle p-2.5 rounded text-xs text-neutral-300 flex items-center justify-between gap-3 shadow-md">
-                <div className="flex items-center gap-2">
-                  <Info className="w-4 h-4 text-accent-amber flex-shrink-0" />
-                  <span>
-                    Server <strong>{activeServer?.serverName}</strong> membatasi iframe langsung. Memutar via <strong>Direct Stream MP4</strong>.
-                  </span>
-                </div>
-                <button
-                  onClick={() => setUsedDirectFallback(false)}
-                  className="text-[11px] text-neutral-400 hover:text-white"
-                >
-                  Tutup
-                </button>
-              </div>
-            )}
-
-            {/* Video Player Render */}
-            {isDirectMode || (usedDirectFallback && selectedQuality) ? (
-              /* Native HTML5 Video Stream */
-              selectedQuality ? (
-                <video
-                  ref={videoRef}
-                  key={selectedQuality.streamUrl}
-                  src={selectedQuality.streamUrl}
-                  controls
-                  autoPlay
-                  playsInline
-                  className="w-full h-full object-contain bg-black"
-                >
-                  Browser Anda tidak mendukung pemutar video HTML5.
-                </video>
-              ) : null
-            ) : embedSrc ? (
-              /* Server Iframe Embed from /api/server/:post/:nume */
+            {/* View 1: Filedon Embed Player (Default, Terbukti Lancar) */}
+            {playerMode === 'filedon' && selectedFiledon ? (
               <iframe
-                src={embedSrc}
+                key={selectedFiledon.embedUrl}
+                src={selectedFiledon.embedUrl}
                 title={episode.title}
                 className="w-full h-full border-0"
                 allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
                 allowFullScreen
               />
-            ) : embedHtml ? (
-              /* Raw HTML Iframe Embed */
-              <div
-                dangerouslySetInnerHTML={{ __html: embedHtml }}
-                className="w-full h-full flex items-center justify-center [&>iframe]:w-full [&>iframe]:h-full [&>iframe]:border-0"
-              />
-            ) : (
-              /* Fallback direct video player */
-              selectedQuality && (
-                <video
-                  ref={videoRef}
-                  src={selectedQuality.streamUrl}
-                  controls
-                  autoPlay
-                  playsInline
-                  className="w-full h-full object-contain bg-black"
+            ) : playerMode === 'direct' && selectedMp4 ? (
+              /* View 2: Direct MP4 Video Player */
+              <video
+                ref={videoRef}
+                key={selectedMp4.streamUrl}
+                src={selectedMp4.streamUrl}
+                controls
+                autoPlay
+                playsInline
+                className="w-full h-full object-contain bg-black"
+              >
+                Browser Anda tidak mendukung pemutar video HTML5.
+              </video>
+            ) : playerMode === 'api' ? (
+              /* View 3: Samehadaku API Iframe */
+              apiEmbedSrc ? (
+                <iframe
+                  src={apiEmbedSrc}
+                  title={episode.title}
+                  className="w-full h-full border-0"
+                  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                  allowFullScreen
                 />
-              )
-            )}
+              ) : apiEmbedHtml ? (
+                <div
+                  dangerouslySetInnerHTML={{ __html: apiEmbedHtml }}
+                  className="w-full h-full flex items-center justify-center [&>iframe]:w-full [&>iframe]:h-full [&>iframe]:border-0"
+                />
+              ) : selectedFiledon ? (
+                <iframe
+                  src={selectedFiledon.embedUrl}
+                  title={episode.title}
+                  className="w-full h-full border-0"
+                  allowFullScreen
+                />
+              ) : null
+            ) : null}
           </div>
 
           {/* Quick Player Bar: Prev / Next / Theater */}
@@ -329,21 +353,18 @@ export const WatchPage: React.FC = () => {
               </button>
             </div>
 
-            {/* Quality Selector (if Direct MP4 Stream is available) */}
-            {mp4Streams.length > 0 && (
+            {/* Quality Selector Pills (for Filedon) */}
+            {playerMode === 'filedon' && filedonStreams.length > 0 && (
               <div className="flex items-center gap-1 bg-background-elevated p-1 rounded border border-border-subtle">
-                <span className="text-[11px] text-neutral-400 px-2 font-medium">Resolusi:</span>
-                {mp4Streams.map((q) => {
-                  const isSelected = selectedQuality?.resolution === q.resolution;
+                <span className="text-[11px] text-neutral-400 px-2 font-medium">Kualitas:</span>
+                {filedonStreams.map((q) => {
+                  const isSelected = selectedFiledon?.resolution === q.resolution;
                   return (
                     <button
                       key={q.resolution}
-                      onClick={() => {
-                        setSelectedQuality(q);
-                        setIsDirectMode(true);
-                      }}
+                      onClick={() => setSelectedFiledon(q)}
                       className={`px-2 py-0.5 rounded text-[11px] font-bold transition-all ${
-                        isSelected && (isDirectMode || usedDirectFallback)
+                        isSelected
                           ? 'bg-primary text-white shadow-xs'
                           : 'text-neutral-400 hover:text-white'
                       }`}
@@ -383,46 +404,58 @@ export const WatchPage: React.FC = () => {
           </div>
         </div>
 
-        {/* Streaming Servers Selector Console (From REST API /api/server/:post/:nume) */}
+        {/* Streaming Servers Selector Console */}
         <div className="p-4 rounded bg-background-surface border border-border-subtle space-y-3">
           <div className="flex items-center justify-between">
             <span className="text-xs font-bold text-neutral-300 uppercase tracking-wider flex items-center gap-1.5">
               <Server className="w-4 h-4 text-primary" />
-              <span>Pilihan Server Streaming (REST API):</span>
+              <span>Pilihan Server Streaming:</span>
             </span>
             <span className="text-[11px] text-neutral-500 hidden sm:inline">
-              Klik server untuk memutar via API iframe
+              Pilih server jika video macet atau lambat
             </span>
           </div>
 
           <div className="flex flex-wrap gap-2">
-            {/* Direct Player Button */}
+            {/* Server Filedon (Recommended) */}
+            {filedonStreams.length > 0 && (
+              <button
+                onClick={() => setPlayerMode('filedon')}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-bold border transition-all ${
+                  playerMode === 'filedon'
+                    ? 'bg-primary text-white border-primary shadow-xs'
+                    : 'bg-background-subtle border-border-subtle text-neutral-400 hover:text-white'
+                }`}
+              >
+                <Film className="w-3.5 h-3.5" />
+                <span>⚡ Server Filedon HD (Aktif)</span>
+              </button>
+            )}
+
+            {/* Direct MP4 Player */}
             {mp4Streams.length > 0 && (
               <button
-                onClick={() => {
-                  setIsDirectMode(true);
-                  setUsedDirectFallback(false);
-                }}
+                onClick={() => setPlayerMode('direct')}
                 className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-bold border transition-all ${
-                  isDirectMode
+                  playerMode === 'direct'
                     ? 'bg-primary text-white border-primary shadow-xs'
                     : 'bg-background-subtle border-border-subtle text-neutral-400 hover:text-white'
                 }`}
               >
                 <Zap className="w-3.5 h-3.5 fill-current" />
-                <span>⚡ Direct Stream MP4</span>
+                <span>Direct Stream MP4</span>
               </button>
             )}
 
-            {/* Official Stream Servers from /api/episode/:slug */}
+            {/* Samehadaku Official API Servers */}
             {episode.streamServers?.map((s) => {
-              const isActive = !isDirectMode && activeServer?.id === s.id;
+              const isActive = playerMode === 'api' && activeApiServer?.id === s.id;
               return (
                 <button
                   key={s.id}
                   onClick={() => {
-                    setIsDirectMode(false);
-                    setActiveServer(s);
+                    setActiveApiServer(s);
+                    setPlayerMode('api');
                   }}
                   className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium border transition-all ${
                     isActive
