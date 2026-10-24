@@ -15,44 +15,120 @@ import {
   RefreshCw,
   HardDrive,
   Film,
+  Zap,
+  MonitorPlay,
+  Check,
 } from 'lucide-react';
 import { apiService } from '@/services/api';
 import { EpisodeDetail, StreamServer, DownloadFormat } from '@/types/anime';
 import { ErrorState } from '@/components/ErrorState';
 import { useWatchHistory } from '@/hooks/useStorage';
 
+interface PlayableStream {
+  format: string;
+  resolution: string;
+  server: string;
+  streamUrl: string;
+  type: 'video' | 'iframe';
+}
+
 export const WatchPage: React.FC = () => {
   const { slug } = useParams<{ slug: string }>();
   const navigate = useNavigate();
 
   const [episode, setEpisode] = useState<EpisodeDetail | null>(null);
+  const [playableStreams, setPlayableStreams] = useState<PlayableStream[]>([]);
+  const [selectedStream, setSelectedStream] = useState<PlayableStream | null>(null);
+
+  // Player mode: 'direct' (HTML5 video), 'acefile' (Iframe player), 'server' (Samehadaku API)
+  const [playerMode, setPlayerMode] = useState<'direct' | 'acefile' | 'server'>('direct');
+
+  // Samehadaku API server state
   const [activeServer, setActiveServer] = useState<StreamServer | null>(null);
   const [embedSrc, setEmbedSrc] = useState<string | null>(null);
   const [embedHtml, setEmbedHtml] = useState<string | null>(null);
+  const [serverStatus, setServerStatus] = useState<'loading' | 'ready' | 'unavailable'>('loading');
+
   const [isLoadingEp, setIsLoadingEp] = useState(true);
-  const [isLoadingServer, setIsLoadingServer] = useState(false);
-  const [serverError, setServerError] = useState<string | null>(null);
   const [activeFormatTab, setActiveFormatTab] = useState<string>('MKV');
   const [theaterMode, setTheaterMode] = useState<boolean>(false);
+  const [videoError, setVideoError] = useState<boolean>(false);
 
   const { saveProgress } = useWatchHistory();
+  const videoRef = useRef<HTMLVideoElement>(null);
   const playerContainerRef = useRef<HTMLDivElement>(null);
 
-  // 1. Fetch episode data
+  // 1. Fetch episode data & extract direct playable streams
   useEffect(() => {
     if (!slug) return;
     setIsLoadingEp(true);
-    setServerError(null);
     setEmbedSrc(null);
     setEmbedHtml(null);
+    setVideoError(false);
 
     apiService
       .getEpisodeDetail(slug)
       .then((data) => {
         setEpisode(data);
-        if (data.streamServers && data.streamServers.length > 0) {
-          setActiveServer(data.streamServers[0]);
+
+        // Extract direct playable streams from downloads
+        const extracted: PlayableStream[] = [];
+        const downloads = data.downloads || [];
+
+        // Preferred formats order: MP4 first (broadest browser support), then x265, then MKV
+        const sortedDownloads = [...downloads].sort((a, b) => {
+          if (a.format.includes('MP4')) return -1;
+          if (b.format.includes('MP4')) return 1;
+          return 0;
+        });
+
+        for (const fmt of sortedDownloads) {
+          for (const res of fmt.resolutions || []) {
+            for (const link of res.links || []) {
+              // 1. Pixeldrain Direct (Direct MP4/MKV video stream)
+              const pixelMatch = link.url.match(/pixeldrain\.com\/u\/([a-zA-Z0-9_-]+)/);
+              if (pixelMatch && pixelMatch[1]) {
+                extracted.push({
+                  format: fmt.format,
+                  resolution: res.resolution,
+                  server: 'Pixeldrain Direct',
+                  streamUrl: `https://pixeldrain.com/api/file/${pixelMatch[1]}`,
+                  type: 'video',
+                });
+              }
+
+              // 2. Acefile Player (Direct iframe player embed)
+              const aceMatch = link.url.match(/acefile\.co\/f\/(\d+)/);
+              if (aceMatch && aceMatch[1]) {
+                extracted.push({
+                  format: fmt.format,
+                  resolution: res.resolution,
+                  server: 'Acefile Player',
+                  streamUrl: `https://acefile.co/player/${aceMatch[1]}`,
+                  type: 'iframe',
+                });
+              }
+            }
+          }
         }
+
+        setPlayableStreams(extracted);
+
+        // Auto select best stream (preferred 720p or 480p or first available)
+        if (extracted.length > 0) {
+          const preferred =
+            extracted.find((s) => s.resolution === '720p' && s.type === 'video') ||
+            extracted.find((s) => s.resolution === '480p' && s.type === 'video') ||
+            extracted.find((s) => s.type === 'video') ||
+            extracted[0];
+
+          setSelectedStream(preferred);
+          setPlayerMode(preferred.type === 'video' ? 'direct' : 'acefile');
+        } else if (data.streamServers && data.streamServers.length > 0) {
+          setActiveServer(data.streamServers[0]);
+          setPlayerMode('server');
+        }
+
         if (data.downloads && data.downloads.length > 0) {
           setActiveFormatTab(data.downloads[0].format);
         }
@@ -69,7 +145,7 @@ export const WatchPage: React.FC = () => {
         });
       })
       .catch((err) => {
-        setServerError(err.message || 'Gagal memuat detail episode.');
+        console.error('Failed to load episode:', err);
       })
       .finally(() => {
         setIsLoadingEp(false);
@@ -78,10 +154,11 @@ export const WatchPage: React.FC = () => {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }, [slug]);
 
-  // 2. Fetch server embed when active server changes
+  // 2. Handle Samehadaku server API selection
   useEffect(() => {
-    if (!activeServer) return;
-    setIsLoadingServer(true);
+    if (playerMode !== 'server' || !activeServer) return;
+
+    setServerStatus('loading');
     setEmbedSrc(null);
     setEmbedHtml(null);
 
@@ -90,29 +167,26 @@ export const WatchPage: React.FC = () => {
       .then((res) => {
         if (res.embedUrl) {
           setEmbedSrc(res.embedUrl);
+          setServerStatus('ready');
         } else if (res.html && res.html !== '-1') {
-          // If HTML contains an iframe string, extract the src or use raw html
           const matchSrc = res.html.match(/src=["'](.*?)["']/i);
           if (matchSrc && matchSrc[1]) {
             setEmbedSrc(matchSrc[1]);
           } else {
             setEmbedHtml(res.html);
           }
+          setServerStatus('ready');
         } else {
-          // If server returned -1, we will provide the smart fallback player
-          setEmbedSrc(null);
-          setEmbedHtml(null);
+          // Upstream Samehadaku returned -1 or empty
+          setServerStatus('unavailable');
         }
       })
-      .catch((err) => {
-        console.warn('Failed to get server embed:', err);
-      })
-      .finally(() => {
-        setIsLoadingServer(false);
+      .catch(() => {
+        setServerStatus('unavailable');
       });
-  }, [activeServer]);
+  }, [playerMode, activeServer]);
 
-  // Keyboard navigation for Prev/Next
+  // Keyboard navigation for Prev/Next & Theater
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
@@ -140,24 +214,36 @@ export const WatchPage: React.FC = () => {
     );
   }
 
-  if (serverError || !episode) {
+  if (!episode) {
     return (
       <div className="py-20">
         <ErrorState
-          title="Gagal Memutar Episode"
-          message={serverError || 'Episode tidak ditemukan.'}
+          title="Gagal Memuat Episode"
+          message="Episode ini tidak ditemukan atau server sedang mengalami kendala."
           onRetry={() => window.location.reload()}
         />
       </div>
     );
   }
 
-  // Find alternative stream link from downloads (e.g. Pixeldrain / Acefile / Gofile) for direct fallback
-  const fallbackDownloadLinks = (episode.downloads || [])
-    .flatMap((fmt) => fmt.resolutions.flatMap((res) => res.links.map((link) => ({ ...link, resolution: res.resolution, format: fmt.format }))))
-    .filter((link) => link.server.toLowerCase().includes('pixeldrain') || link.server.toLowerCase().includes('acefile') || link.server.toLowerCase().includes('gofile'));
-
   const parentSlug = episode.parentAnime?.slug || slug?.replace(/-episode-\d+.*$/, '') || '';
+
+  // Get distinct resolutions for the direct video player
+  const directVideoQualities = Array.from(
+    new Map(
+      playableStreams
+        .filter((s) => s.type === 'video')
+        .map((s) => [s.resolution, s])
+    ).values()
+  );
+
+  const acefileQualities = Array.from(
+    new Map(
+      playableStreams
+        .filter((s) => s.type === 'iframe')
+        .map((s) => [s.resolution, s])
+    ).values()
+  );
 
   return (
     <div className="pb-16 space-y-8">
@@ -186,61 +272,109 @@ export const WatchPage: React.FC = () => {
 
       <div className={`mx-auto px-4 sm:px-6 lg:px-8 space-y-6 ${theaterMode ? 'max-w-full' : 'max-w-7xl'}`}>
         
-        {/* Main Player Container */}
+        {/* Main Video Player Container */}
         <div ref={playerContainerRef} className="space-y-3">
           <div className="relative aspect-video w-full rounded bg-black border border-border overflow-hidden shadow-elevated">
             
-            {/* Loading Indicator */}
-            {isLoadingServer && (
-              <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/80 backdrop-blur-xs">
-                <div className="w-10 h-10 border-3 border-primary border-t-transparent rounded-full animate-spin mb-3" />
-                <p className="text-xs font-semibold text-neutral-300">
-                  Menghubungkan ke {activeServer?.serverName || 'server'}...
-                </p>
-              </div>
-            )}
-
-            {/* Video Embed Frame */}
-            {embedSrc ? (
+            {/* Player View: Direct HTML5 Video */}
+            {playerMode === 'direct' && selectedStream && !videoError ? (
+              <video
+                ref={videoRef}
+                key={selectedStream.streamUrl}
+                src={selectedStream.streamUrl}
+                controls
+                autoPlay
+                playsInline
+                className="w-full h-full object-contain bg-black"
+                onError={() => {
+                  console.warn('Video error on stream, falling back to iframe');
+                  setVideoError(true);
+                  if (acefileQualities.length > 0) {
+                    setPlayerMode('acefile');
+                    setSelectedStream(acefileQualities[0]);
+                  }
+                }}
+              >
+                Browser Anda tidak mendukung pemutar video HTML5.
+              </video>
+            ) : playerMode === 'acefile' && selectedStream ? (
+              /* Player View: Acefile Embed Iframe */
               <iframe
-                src={embedSrc}
+                src={selectedStream.streamUrl}
                 title={episode.title}
                 className="w-full h-full border-0"
                 allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
                 allowFullScreen
               />
-            ) : embedHtml ? (
-              <div
-                dangerouslySetInnerHTML={{ __html: embedHtml }}
-                className="w-full h-full flex items-center justify-center [&>iframe]:w-full [&>iframe]:h-full [&>iframe]:border-0"
-              />
+            ) : playerMode === 'server' ? (
+              /* Player View: Samehadaku API Server */
+              serverStatus === 'loading' ? (
+                <div className="w-full h-full flex flex-col items-center justify-center bg-black/90">
+                  <div className="w-10 h-10 border-3 border-primary border-t-transparent rounded-full animate-spin mb-3" />
+                  <p className="text-xs font-semibold text-neutral-300">
+                    Menghubungkan ke {activeServer?.serverName || 'server'}...
+                  </p>
+                </div>
+              ) : serverStatus === 'ready' && embedSrc ? (
+                <iframe
+                  src={embedSrc}
+                  title={episode.title}
+                  className="w-full h-full border-0"
+                  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                  allowFullScreen
+                />
+              ) : serverStatus === 'ready' && embedHtml ? (
+                <div
+                  dangerouslySetInnerHTML={{ __html: embedHtml }}
+                  className="w-full h-full flex items-center justify-center [&>iframe]:w-full [&>iframe]:h-full [&>iframe]:border-0"
+                />
+              ) : (
+                /* Auto-switch prompt if server returned -1 */
+                <div className="w-full h-full flex flex-col items-center justify-center p-6 text-center bg-gradient-to-b from-[#111319] to-[#090a0f]">
+                  <div className="w-12 h-12 rounded-full bg-primary/10 border border-primary/20 flex items-center justify-center text-primary mb-3">
+                    <Zap className="w-6 h-6 text-primary" />
+                  </div>
+                  <h3 className="text-base font-bold text-white mb-2">
+                    Server {activeServer?.serverName} Sedang Mengalami Hambatan
+                  </h3>
+                  <p className="text-xs text-neutral-400 max-w-md mb-5 leading-relaxed">
+                    Server Samehadaku ini sedang membatasi pemutaran lintas domain. Klik tombol di bawah untuk langsung menonton menggunakan <strong>iWatch Direct Player HD</strong>.
+                  </p>
+                  <button
+                    onClick={() => {
+                      setPlayerMode('direct');
+                      if (directVideoQualities.length > 0) {
+                        setSelectedStream(directVideoQualities[0]);
+                      }
+                    }}
+                    className="inline-flex items-center gap-2 px-5 py-2.5 rounded bg-primary hover:bg-primary-hover text-white text-xs font-bold transition-colors shadow-card"
+                  >
+                    <Play className="w-4 h-4 fill-white" />
+                    <span>Putar Sekarang (iWatch Direct Player HD)</span>
+                  </button>
+                </div>
+              )
             ) : (
-              /* Fallback Screen if upstream embed returns -1 */
+              /* Fallback if everything else is unavailable */
               <div className="w-full h-full flex flex-col items-center justify-center p-6 text-center bg-gradient-to-b from-[#111319] to-[#090a0f]">
-                <div className="w-12 h-12 rounded-full bg-primary/10 border border-primary/20 flex items-center justify-center text-primary mb-3">
-                  <Play className="w-6 h-6 fill-primary" />
-                </div>
-                <h3 className="text-base font-bold text-white mb-1">
-                  Pemutar Siap Diputar: {activeServer?.serverName || 'Server Utama'}
+                <MonitorPlay className="w-10 h-10 text-primary mb-3" />
+                <h3 className="text-base font-bold text-white mb-2">
+                  Pilih Sumber Pemutar Video
                 </h3>
-                <p className="text-xs text-neutral-400 max-w-md mb-5 leading-relaxed">
-                  Server ini membatasi pemutaran otomatis lintas domain. Anda dapat memuat server cadangan di bawah ini atau memutar via link streaming langsung.
+                <p className="text-xs text-neutral-400 max-w-sm mb-4">
+                  Pilih salah satu server pemutar di bawah untuk mulai memutar video secara instan.
                 </p>
-
-                <div className="flex flex-wrap items-center justify-center gap-2 max-w-md">
-                  {fallbackDownloadLinks.slice(0, 3).map((link, idx) => (
-                    <a
-                      key={idx}
-                      href={link.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded bg-primary hover:bg-primary-hover text-white text-xs font-semibold transition-colors"
-                    >
-                      <ExternalLink className="w-3.5 h-3.5" />
-                      <span>Buka {link.server} ({link.resolution})</span>
-                    </a>
-                  ))}
-                </div>
+                {directVideoQualities.length > 0 && (
+                  <button
+                    onClick={() => {
+                      setPlayerMode('direct');
+                      setSelectedStream(directVideoQualities[0]);
+                    }}
+                    className="px-4 py-2 rounded bg-primary text-white text-xs font-bold"
+                  >
+                    Putar via Direct Player
+                  </button>
+                )}
               </div>
             )}
           </div>
@@ -296,35 +430,124 @@ export const WatchPage: React.FC = () => {
           </div>
         </div>
 
-        {/* Streaming Servers Selector Tabs */}
-        {episode.streamServers && episode.streamServers.length > 0 && (
-          <div className="p-4 rounded bg-background-surface border border-border-subtle space-y-3">
-            <div className="flex items-center gap-2 text-xs font-bold text-neutral-300 uppercase tracking-wider">
-              <Server className="w-4 h-4 text-primary" />
-              <span>Pilihan Server Streaming:</span>
+        {/* Server & Quality Switcher Console */}
+        <div className="p-4 rounded bg-background-surface border border-border-subtle space-y-4">
+          
+          {/* Main Engine Mode Selection */}
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-neutral-300 uppercase tracking-wider flex items-center gap-1.5">
+                <Server className="w-4 h-4 text-primary" />
+                <span>Pilih Mesin Pemutar:</span>
+              </span>
+              <span className="text-[11px] text-neutral-500 hidden sm:inline">
+                Pilih mesin pemutar jika satu server bermasalah
+              </span>
             </div>
 
             <div className="flex flex-wrap gap-2">
-              {episode.streamServers.map((s) => {
-                const isActive = activeServer?.id === s.id;
+              {/* Direct Player (HTML5 Native) */}
+              {directVideoQualities.length > 0 && (
+                <button
+                  onClick={() => {
+                    setPlayerMode('direct');
+                    setVideoError(false);
+                    if (!selectedStream || selectedStream.type !== 'video') {
+                      setSelectedStream(directVideoQualities[0]);
+                    }
+                  }}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-bold border transition-all ${
+                    playerMode === 'direct'
+                      ? 'bg-primary text-white border-primary shadow-xs'
+                      : 'bg-background-subtle border-border-subtle text-neutral-400 hover:text-white'
+                  }`}
+                >
+                  <Zap className="w-3.5 h-3.5 fill-current" />
+                  <span>⚡ iWatch Direct Player HD (Rekomendasi)</span>
+                </button>
+              )}
+
+              {/* Acefile Player */}
+              {acefileQualities.length > 0 && (
+                <button
+                  onClick={() => {
+                    setPlayerMode('acefile');
+                    if (!selectedStream || selectedStream.type !== 'iframe') {
+                      setSelectedStream(acefileQualities[0]);
+                    }
+                  }}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-bold border transition-all ${
+                    playerMode === 'acefile'
+                      ? 'bg-primary text-white border-primary shadow-xs'
+                      : 'bg-background-subtle border-border-subtle text-neutral-400 hover:text-white'
+                  }`}
+                >
+                  <Film className="w-3.5 h-3.5" />
+                  <span>Acefile Embed Player</span>
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Quality Selector (when Direct Player or Acefile Player is active) */}
+          {playerMode === 'direct' && directVideoQualities.length > 0 && (
+            <div className="pt-2 border-t border-border-subtle/60 flex flex-wrap items-center gap-2">
+              <span className="text-xs font-semibold text-neutral-400 mr-2">
+                Pilih Kualitas Video:
+              </span>
+              {directVideoQualities.map((item) => {
+                const isSelected = selectedStream?.streamUrl === item.streamUrl;
                 return (
                   <button
-                    key={s.id}
-                    onClick={() => setActiveServer(s)}
-                    className={`flex items-center gap-2 px-3 py-1.5 rounded text-xs font-semibold border transition-all ${
-                      isActive
-                        ? 'bg-primary text-white border-primary shadow-xs'
-                        : 'bg-background-subtle border-border-subtle text-neutral-400 hover:text-white hover:border-neutral-600'
+                    key={item.resolution}
+                    onClick={() => {
+                      setSelectedStream(item);
+                      setVideoError(false);
+                    }}
+                    className={`px-3 py-1 rounded text-xs font-bold border transition-all ${
+                      isSelected
+                        ? 'bg-accent-amber/15 text-accent-amber border-accent-amber'
+                        : 'bg-background-elevated border-border-subtle text-neutral-300 hover:text-white'
                     }`}
                   >
-                    <Play className="w-3 h-3 fill-current" />
-                    <span>{s.serverName}</span>
+                    {item.resolution}
                   </button>
                 );
               })}
             </div>
-          </div>
-        )}
+          )}
+
+          {/* Samehadaku Server Selector (Alternative fallback) */}
+          {episode.streamServers && episode.streamServers.length > 0 && (
+            <div className="pt-2 border-t border-border-subtle/60 space-y-2">
+              <span className="text-xs font-semibold text-neutral-400 block">
+                Server Asli Samehadaku (Jika Ingin Mencoba Server Web Asli):
+              </span>
+              <div className="flex flex-wrap gap-1.5">
+                {episode.streamServers.map((s) => {
+                  const isActive = playerMode === 'server' && activeServer?.id === s.id;
+                  return (
+                    <button
+                      key={s.id}
+                      onClick={() => {
+                        setPlayerMode('server');
+                        setActiveServer(s);
+                      }}
+                      className={`flex items-center gap-1 px-2.5 py-1 rounded text-xs font-medium border transition-all ${
+                        isActive
+                          ? 'bg-primary text-white border-primary shadow-xs'
+                          : 'bg-background-subtle border-border-subtle text-neutral-400 hover:text-white hover:border-neutral-600'
+                      }`}
+                    >
+                      <Play className="w-2.5 h-2.5 fill-current" />
+                      <span>{s.serverName}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
 
         {/* Episode Info Heading */}
         <div className="space-y-2 border-b border-border-subtle pb-4">
@@ -417,4 +640,3 @@ export const WatchPage: React.FC = () => {
     </div>
   );
 };
-
